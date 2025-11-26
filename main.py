@@ -77,6 +77,12 @@ TRAIN_BIN_PATH = os.path.join(DIRS["DATA"], "train.bin")
 
 # 🔥 PRESETS (Math Perfect + Optimized for 8GB VRAM)
 PRESETS = {
+    "Krolik (45M) MACOS TEST":  { 
+        "h": 512,   "i": 1376, "l": 8,   "hd": 8,  "kv": 4, 
+        "ctx": 512, "bs": 1,  "acc": 64, "steps": 5000, 
+        "lr": 8e-4 
+    },
+
     # 🐇 KROLIK (45M) - Быстрый тест
     "Krolik (45M)":  { 
         "h": 512,   "i": 1376, "l": 8,   "hd": 8,  "kv": 4, 
