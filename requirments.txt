@@ -1,13 +1,13 @@
-torch>=2.1.0
-transformers>=4.36.0
-tokenizers>=0.15.0
-gradio>=4.0.0
-pandas
+torch>=2.2.0
 numpy
+pandas
+gradio
+sentencepiece
+transformers
 safetensors
 accelerate
 requests
-gguf>=0.6.0
-bitsandbytes; platform_system != "Windows"
-# Если Windows, bitsandbytes обычно не ставится автоматом, 
-# скрипт будет работать на torch.optim (это предусмотрено).
+datasets
+tqdm
+tensorboard
+bitsandbytes; platform_system == "Linux"

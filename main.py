@@ -11,6 +11,7 @@ import subprocess
 import requests
 import json
 import re
+import atexit
 import pandas as pd
 import numpy as np
 import torch
@@ -21,7 +22,6 @@ from safetensors.torch import save_file, load_file
 
 # ================= ⚙️ HARDWARE SETUP =================
 
-# 1. Определяем устройство (NVIDIA vs Apple Silicon vs CPU)
 if torch.cuda.is_available():
     DEVICE = "cuda"
     torch.set_float32_matmul_precision('high')
@@ -46,14 +46,19 @@ except ImportError:
     print("❌ CRITICAL: 'bulba_rust' not found! Run: maturin develop --release")
     HAS_RUST = False
 
-# Bitsandbytes работает только на CUDA (обычно)
 HAS_BNB = False
 if DEVICE == "cuda":
     try:
         import bitsandbytes as bnb
         HAS_BNB = True
-    except ImportError: 
-        HAS_BNB = False
+    except ImportError: HAS_BNB = False
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    HAS_TB = True
+except ImportError:
+    HAS_TB = False
+    print("⚠️ TensorBoard not found. Graphs will be disabled.")
 
 # --- DIRS ---
 DIRS = {
@@ -64,17 +69,71 @@ DIRS = {
     "TOKENIZER": os.path.join("system", "tokenizer"),
     "TOOLS": os.path.join("system", "tools"),
     "TEMP": os.path.join("system", "temp_convert"),
-    "TEMP_TRAIN": os.path.join("system", "temp_train_tok")
+    "TEMP_TRAIN": os.path.join("system", "temp_train_tok"),
+    "LOGS": "runs"
 }
 for d in DIRS.values(): os.makedirs(d, exist_ok=True)
 TRAIN_BIN_PATH = os.path.join(DIRS["DATA"], "train.bin")
 
-# 🔥 PRESETS
+# 🔥 PRESETS (Math Perfect + Optimized for 8GB VRAM)
 PRESETS = {
-    "Krolik (50M)":  { "h": 512,  "i": 1376, "l": 8,  "hd": 8,  "kv": 4, "ctx": 512, "bs": 8, "acc": 8, "steps": 5000 },
-    "AIst (150M)":   { "h": 768,  "i": 2048, "l": 12, "hd": 12, "kv": 4, "ctx": 512, "bs": 8, "acc": 8, "steps": 10000 },
-    "Zubr (350M)":   { "h": 1024, "i": 2816, "l": 28, "hd": 16, "kv": 4, "ctx": 512, "bs": 2, "acc": 32, "steps": 15000 },
+    # 🐇 KROLIK (45M) - Быстрый тест
+    "Krolik (45M)":  { 
+        "h": 512,   "i": 1376, "l": 8,   "hd": 8,  "kv": 4, 
+        "ctx": 512, "bs": 16,  "acc": 4, "steps": 5000, 
+        "lr": 8e-4 
+    },
+
+    # 🐦 VORONA (110M) - Классика
+    "Vorona (110M)": { 
+        "h": 768,   "i": 2048, "l": 12,  "hd": 12, "kv": 4, 
+        "ctx": 512, "bs": 8,   "acc": 8, "steps": 8000, 
+        "lr": 6e-4
+    },
+    
+    # 🦢 AIST (250M) - Баланс (hd=16, kv=4 -> Ratio 4:1 OK)
+    "AIst (250M)":   { 
+        "h": 1024,  "i": 2816, "l": 16,  "hd": 16, "kv": 4, 
+        "ctx": 512, "bs": 4,   "acc": 16, "steps": 12000, 
+        "lr": 4e-4
+    },
+
+    # 🦬 ZUBR (600M) - Мощь для 8GB (hd=24, kv=8 -> Ratio 3:1 OK)
+    "Zubr (600M)":   { 
+        "h": 1536,  "i": 4096, "l": 22,  "hd": 24, "kv": 8, 
+        "ctx": 512, "bs": 1,   "acc": 64, "steps": 18000, 
+        "lr": 3e-4
+    },
 }
+
+# ================= 📊 TENSORBOARD MANAGER =================
+
+tb_process = None
+
+def start_tensorboard_background():
+    global tb_process
+    if not HAS_TB or tb_process is not None: return
+
+    print("📊 Starting TensorBoard background service...")
+    log_dir = os.path.abspath(DIRS["LOGS"])
+    
+    cmd = [sys.executable, "-m", "tensorboard.main", "--logdir", log_dir, "--port", "6006", "--host", "0.0.0.0"]
+    
+    try:
+        tb_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"✅ TensorBoard started on http://localhost:6006 (Embedded)")
+    except Exception as e:
+        print(f"❌ Failed to start TensorBoard: {e}")
+
+def kill_tensorboard():
+    global tb_process
+    if tb_process:
+        tb_process.terminate()
+        tb_process = None
+
+atexit.register(kill_tensorboard)
+
+# ================= HELPER FUNCTIONS =================
 
 def format_size(size_bytes):
     if size_bytes == 0: return "0 B"
@@ -87,6 +146,16 @@ def get_lr(step, max_steps, max_lr):
     if step > max_steps: return max_lr * 0.1
     decay = (step - warmup) / (max_steps - warmup)
     return max_lr * 0.1 + 0.5 * (1.0 + math.cos(math.pi * decay)) * (max_lr - max_lr * 0.1)
+
+def activate_neftune(model, noise_alpha=5.0):
+    def neftune_hook(module, input, output):
+        if module.training:
+            dims = torch.tensor(output.size(1) * output.size(2), device=output.device)
+            mag_norm = noise_alpha / torch.sqrt(dims)
+            output = output + torch.zeros_like(output).uniform_(-mag_norm, mag_norm)
+        return output
+    model.get_input_embeddings().register_forward_hook(neftune_hook)
+    print(f"✨ NEFTune activated (alpha={noise_alpha})")
 
 def check_system_status():
     bin_exists = os.path.exists(TRAIN_BIN_PATH)
@@ -152,13 +221,12 @@ def train_sentencepiece_model(files, vocab_size, output_dir):
     shutil.rmtree(DIRS["TEMP_TRAIN"], ignore_errors=True)
     print(f"✅ Tokenizer saved to {output_dir}")
 
-# ================= 🚀 PROCESSING (With Shuffle) =================
+# ================= 🚀 PROCESSING =================
 
 def process_data(upload_files, local_path, progress=gr.Progress()):
     if not HAS_RUST: return "❌ Rust Missing", None, 0, pd.DataFrame(), "Error"
     gc.collect()
     
-    # 1. Сбор файлов
     files = []
     search_path = local_path if local_path else DIRS["DATA"]
     if upload_files: files = [f.name for f in upload_files]
@@ -170,7 +238,6 @@ def process_data(upload_files, local_path, progress=gr.Progress()):
 
     if not files: return f"⚠️ No files in {search_path}", TRAIN_BIN_PATH, 0, pd.DataFrame(), "Error"
 
-    # 2. Токенизатор
     tok_dir = DIRS["TOKENIZER"]
     if not os.path.exists(os.path.join(tok_dir, "tokenizer.model")):
         progress(0.1, desc="🇧🇾 Training SentencePiece...")
@@ -179,7 +246,6 @@ def process_data(upload_files, local_path, progress=gr.Progress()):
         except Exception as e:
             return f"❌ SPM Train Error: {e}", None, 0, pd.DataFrame(), "Error"
 
-    # 3. Rust Токенизация
     progress(0.3, desc="🇧🇾 Rust: Tokenizing...")
     if os.path.exists(TRAIN_BIN_PATH): os.remove(TRAIN_BIN_PATH)
 
@@ -216,18 +282,16 @@ def process_data(upload_files, local_path, progress=gr.Progress()):
         
     t.join()
 
-    # 4. 🔥 RUST SHUFFLE 🔥
     if task["done"] and os.path.exists(TRAIN_BIN_PATH):
         try:
             progress(0.9, desc="🎲 Shuffling dataset (Rust)...")
             yield "🎲 Shuffling dataset...", TRAIN_BIN_PATH, 0, pd.DataFrame(hist_data), "Shuffling..."
             
-            eos_id = 2 # Стандарт для Llama
+            eos_id = 2 
             temp_bin = os.path.join(DIRS["DATA"], "temp_unshuffled.bin")
             if os.path.exists(temp_bin): os.remove(temp_bin)
             os.rename(TRAIN_BIN_PATH, temp_bin)
             
-            # Вызов Rust шаффлера
             bulba_rust.shuffle_dataset(temp_bin, TRAIN_BIN_PATH, eos_id)
             
             if os.path.exists(temp_bin): os.remove(temp_bin)
@@ -245,24 +309,46 @@ def process_data(upload_files, local_path, progress=gr.Progress()):
 STOP_FLAG = False
 SAVE_FLAG = False 
 
-def save_safe(model, path):
+def save_safe(model, path, optim=None, step=0):
     folder = os.path.dirname(path)
     if not os.path.exists(folder): os.makedirs(folder, exist_ok=True)
+    
     raw = model._orig_mod if hasattr(model, "_orig_mod") else model
     sd = raw.state_dict()
     if "lm_head.weight" in sd and "model.embed_tokens.weight" in sd:
         if sd["lm_head.weight"].data_ptr() == sd["model.embed_tokens.weight"].data_ptr():
             del sd["lm_head.weight"]
     save_file(sd, path)
-    print(f"💾 Saved: {path}")
+    
+    if optim is not None:
+        optim_path = path.replace(".safetensors", ".pt").replace("step_", "optim_step_").replace("manual_", "optim_manual_")
+        torch.save(optim.state_dict(), optim_path)
+        print(f"💾 Saved Optimizer: {optim_path}")
+        
+        try:
+            optim_files = sorted(glob.glob(f"{folder}/optim_step_*.pt"), key=os.path.getmtime)
+            if len(optim_files) > 3:
+                for old_f in optim_files[:-3]:
+                    os.remove(old_f)
+        except: pass
+    else:
+        print(f"💾 Saved Model: {path}")
 
-def train_loop(train_path, model_name, lr, steps_ui, mode, resume_path, progress=gr.Progress()):
+def train_loop(train_path, model_name, lr_in, steps_ui, mode, resume_path, use_logging, use_neftune, progress=gr.Progress()):
     global STOP_FLAG, SAVE_FLAG
     STOP_FLAG = False
     SAVE_FLAG = False
     
     gc.collect()
     torch.cuda.empty_cache() if DEVICE == "cuda" else None
+    
+    # --- TensorBoard ---
+    writer = None
+    if use_logging and HAS_TB:
+        run_name = f"{model_name.split()[0]}-{datetime.datetime.now().strftime('%b%d_%H-%M')}"
+        log_dir = os.path.join(DIRS["LOGS"], run_name)
+        writer = SummaryWriter(log_dir=log_dir)
+        print(f"📊 Logging to: {log_dir}")
     
     target_bin = train_path if train_path else TRAIN_BIN_PATH
     if not os.path.exists(target_bin): return f"❌ Data not found", None, pd.DataFrame()
@@ -282,7 +368,10 @@ def train_loop(train_path, model_name, lr, steps_ui, mode, resume_path, progress
         attn_implementation="sdpa"
     )
     
-    model = LlamaForCausalLM(conf).to(DEVICE)
+    # 🔥 FIX: Грузим модель сразу в BFloat16 (для 30/40 серии RTX)
+    dtype_load = torch.bfloat16 if DEVICE == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
+    print(f"⚙️ Model Dtype: {dtype_load}")
+    model = LlamaForCausalLM(conf).to(device=DEVICE, dtype=dtype_load)
     
     start_step = 0
     if resume_path and os.path.exists(resume_path):
@@ -294,7 +383,8 @@ def train_loop(train_path, model_name, lr, steps_ui, mode, resume_path, progress
             if match: start_step = int(match.group(1))
         except Exception as e: return f"❌ Resume Error: {e}", None, pd.DataFrame()
     
-    # Компиляция (Только NVIDIA)
+    if use_neftune: activate_neftune(model)
+
     if ("Compile" in mode or "Both" in mode) and DEVICE == "cuda":
         print("⚡ Compiling Model...")
         try: model = torch.compile(model, mode="reduce-overhead")
@@ -302,15 +392,23 @@ def train_loop(train_path, model_name, lr, steps_ui, mode, resume_path, progress
 
     model.train()
 
-    # Оптимизатор (BNB только на NVIDIA)
+    # Оптимизатор
     if HAS_BNB and DEVICE == "cuda":
         print("⚖️ Using 8-bit AdamW")
-        optim = bnb.optim.AdamW8bit(model.parameters(), lr=lr)
+        optim = bnb.optim.AdamW8bit(model.parameters(), lr=lr_in)
     else:
-        print(f"⚖️ Using Standard AdamW (Device: {DEVICE})")
-        optim = torch.optim.AdamW(model.parameters(), lr=lr, fused=(DEVICE=="cuda"))
+        print(f"⚖️ Using Standard AdamW")
+        optim = torch.optim.AdamW(model.parameters(), lr=lr_in, fused=(DEVICE=="cuda"))
     
-    scaler = torch.amp.GradScaler() if DEVICE == "cuda" else None
+    if start_step > 0:
+        optim_name = os.path.basename(resume_path).replace(".safetensors", ".pt").replace("step_", "optim_step_").replace("manual_", "optim_manual_")
+        optim_path = os.path.join(DIRS["CHECKPOINTS"], optim_name)
+        if os.path.exists(optim_path):
+            try: optim.load_state_dict(torch.load(optim_path, map_location=DEVICE))
+            except: pass
+
+    # 🔥 FIX: Убираем GradScaler, так как BF16 в нем не нуждается
+    # scaler = torch.amp.GradScaler() <-- УДАЛЕНО
     
     try: loader = bulba_rust.RustDataLoader(target_bin, tok.eos_token_id, True)
     except Exception as e: return f"❌ Loader Error: {e}", None, pd.DataFrame()
@@ -320,12 +418,12 @@ def train_loop(train_path, model_name, lr, steps_ui, mode, resume_path, progress
     t0 = time.time()
     expected_len = p["bs"] * (p["ctx"] + 1)
 
-    print(f"🚀 STARTING LOOP ({start_step} -> {max_steps}) on {DEVICE}...")
+    print(f"🚀 STARTING LOOP ({start_step} -> {max_steps}) in BFloat16...")
 
     for step in range(start_step, max_steps):
         if STOP_FLAG: break
         
-        current_lr = get_lr(step, max_steps, lr)
+        current_lr = get_lr(step, max_steps, lr_in)
         for g in optim.param_groups: g['lr'] = current_lr
         
         optim.zero_grad(set_to_none=True) 
@@ -339,35 +437,30 @@ def train_loop(train_path, model_name, lr, steps_ui, mode, resume_path, progress
             data = torch.from_numpy(data_np).view(p["bs"], p["ctx"] + 1).to(DEVICE, non_blocking=True)
             data.clamp_(max=len(tok)-1)
 
-            # --- CROSS PLATFORM AUTOCAST ---
+            # 🔥 FIX: Используем autocast с bfloat16
             if DEVICE == "cuda":
-                with torch.amp.autocast("cuda"):
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     loss = model(data[:, :-1], labels=data[:, 1:]).loss / p["acc"]
             else:
-                # MPS/CPU: обычно работаем в float32 или bfloat16 напрямую, без autocast
                 loss = model(data[:, :-1], labels=data[:, 1:]).loss / p["acc"]
             
-            if scaler:
-                scaler.scale(loss).backward()
-                loss_accum += loss.item()
-            else:
-                loss.backward()
-                loss_accum += loss.item()
+            # 🔥 FIX: Обычный backward без скейлинга
+            loss.backward()
+            loss_accum += loss.item()
         
-        if scaler:
-            scaler.unscale_(optim)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optim)
-            scaler.update()
-        else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optim.step()
+        # 🔥 FIX: Обычный шаг
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optim.step()
         
         if step == start_step: avg_loss = loss_accum
         else: avg_loss = 0.95 * avg_loss + 0.05 * loss_accum
         
+        if writer is not None and step % 10 == 0:
+            writer.add_scalar("Train/Loss", avg_loss, step)
+            writer.add_scalar("Train/LR", current_lr, step)
+        
         if SAVE_FLAG:
-            save_safe(model, f"{DIRS['CHECKPOINTS']}/manual_{step}.safetensors")
+            save_safe(model, f"{DIRS['CHECKPOINTS']}/manual_{step}.safetensors", optim, step)
             SAVE_FLAG = False
 
         if step % 10 == 0:
@@ -378,19 +471,21 @@ def train_loop(train_path, model_name, lr, steps_ui, mode, resume_path, progress
             eta = str(datetime.timedelta(seconds=int((max_steps - step) / (steps_done/dt))))
             hist_tr.append({"step": step, "loss": avg_loss})
             
+            if writer: writer.add_scalar("Perf/Tokens_Sec", spd, step)
+
             if step % 500 == 0 and step > 0: 
-                save_safe(model, f"{DIRS['CHECKPOINTS']}/step_{step}.safetensors")
+                save_safe(model, f"{DIRS['CHECKPOINTS']}/step_{step}.safetensors", optim, step)
                 
             yield f"Step: {step} | Loss: {avg_loss:.4f} | Speed: {spd} tok/s | ETA: {eta}", pd.DataFrame(hist_tr)
 
-    save_safe(model, f"{DIRS['CHECKPOINTS']}/final.safetensors")
+    if writer: writer.close()
+    save_safe(model, f"{DIRS['CHECKPOINTS']}/final.safetensors", optim, max_steps)
     yield "✅ Done!", pd.DataFrame(hist_tr)
 
 def stop_train(): global STOP_FLAG; STOP_FLAG = True; return "🛑 Stopping..."
 def trigger_save(): global SAVE_FLAG; SAVE_FLAG = True; return "💾 Saving..." 
 
 # ================= 📦 EXPORT =================
-# (Без изменений, так как тут чистый Python)
 def auto_export_gguf(selected_ckpt, model_name_ui):
     if not selected_ckpt: return "❌ No checkpoint selected"
     yield f"Selected: {selected_ckpt}"
@@ -410,7 +505,7 @@ def auto_export_gguf(selected_ckpt, model_name_ui):
     try:
         yield "📂 Preparing files..."
         shutil.copy(os.path.join(DIRS["TOKENIZER"], "tokenizer.model"), os.path.join(hf_path, "tokenizer.model"))
-        p = PRESETS.get(model_name_ui, PRESETS["AIst (150M)"])
+        p = PRESETS.get(model_name_ui, PRESETS["AIst (250M)"])
         manual_config = {
             "architectures": ["LlamaForCausalLM"], "model_type": "llama", "vocab_size": 32000,
             "hidden_size": p["h"], "intermediate_size": p["i"], "num_hidden_layers": p["l"],
@@ -432,10 +527,12 @@ def auto_export_gguf(selected_ckpt, model_name_ui):
     except Exception as e: yield f"❌ Python Error: {e}"
 
 # ================= UI =================
-def update_steps(name): return gr.Number(value=PRESETS[name]["steps"])
+def update_params(name):
+    p = PRESETS[name]
+    return p["steps"], p["lr"]
 
 with gr.Blocks(title="BulbaGPT Studio") as demo:
-    gr.Markdown("# 🥔 BulbaGPT Studio: Cross-Platform")
+    gr.Markdown("# 🥔 BulbaGPT Studio V2.5: FOSS Edition")
     s_path = gr.State(TRAIN_BIN_PATH)
     s_data_dir = gr.State(DIRS["DATA"])
 
@@ -448,10 +545,20 @@ with gr.Blocks(title="BulbaGPT Studio") as demo:
                     status_proc = gr.Textbox(label="Status")
                     plot_proc = gr.LinePlot(x="time", y="speed", title="Processing Speed (MB/s)", height=250)
                     
-                    model_sel = gr.Radio(list(PRESETS.keys()), value="AIst (150M)", label="Config")
-                    steps = gr.Number(label="Steps", value=10000)
-                    model_sel.change(update_steps, model_sel, steps)
-                    mode = gr.Dropdown(["Compile", "Flash Attention", "Both"], value="Both", label="Mode (NVIDIA Only)")
+                    # Выбор модели и Авто-LR
+                    model_sel = gr.Radio(list(PRESETS.keys()), value="AIst (250M)", label="Config")
+                    with gr.Row():
+                        steps = gr.Number(label="Steps", value=12000)
+                        lr_input = gr.Number(label="Learning Rate", value=4e-4, step=1e-5, precision=6)
+                    
+                    model_sel.change(update_params, inputs=model_sel, outputs=[steps, lr_input])
+                    
+                    mode = gr.Dropdown(["Compile", "Flash Attention", "Both"], value="Flash Attention", label="Mode (NVIDIA Only)")
+                    
+                    with gr.Accordion("🛠 Advanced Options", open=True):
+                        with gr.Row():
+                            use_logging = gr.Checkbox(label="📊 Use TensorBoard Logging", value=True)
+                            use_neftune = gr.Checkbox(label="✨ Use NEFTune", value=False)
                     
                     with gr.Row():
                         resume_ckpt = gr.Dropdown(label="Resume from Checkpoint", choices=[], value=None, scale=3)
@@ -465,6 +572,10 @@ with gr.Blocks(title="BulbaGPT Studio") as demo:
                     status_train = gr.Textbox(label="Log")
                     plot = gr.LinePlot(x="step", y="loss", title="Loss", height=300)
         
+        with gr.Tab("📊 Graphs (TensorBoard)"):
+            gr.Markdown("## Real-time Training Graphs")
+            gr.HTML('<iframe src="http://localhost:6006" width="100%" height="800" style="border:none;"></iframe>')
+            
         with gr.Tab("📦 Export"):
             ckpt = gr.Dropdown(label="Checkpoint")
             btn_ref = gr.Button("Refresh")
@@ -476,7 +587,9 @@ with gr.Blocks(title="BulbaGPT Studio") as demo:
     demo.load(scan_checkpoints, outputs=resume_ckpt)
     
     btn_proc.click(process_data, [files, s_data_dir], [status_proc, s_path, gr.State(), plot_proc, gr.State()])
-    btn_run.click(train_loop, [s_path, model_sel, gr.Number(3e-4, visible=False), steps, mode, resume_ckpt], [status_train, plot])
+    btn_run.click(train_loop, 
+                  [s_path, model_sel, lr_input, steps, mode, resume_ckpt, use_logging, use_neftune], 
+                  [status_train, plot])
     btn_stop.click(stop_train, outputs=status_train)
     btn_save.click(trigger_save, outputs=status_train)
     btn_ref.click(scan_checkpoints, outputs=ckpt)
@@ -484,4 +597,5 @@ with gr.Blocks(title="BulbaGPT Studio") as demo:
     btn_exp.click(auto_export_gguf, inputs=[ckpt, model_sel], outputs=log_exp)
 
 if __name__ == "__main__":
+    start_tensorboard_background()
     demo.queue().launch()

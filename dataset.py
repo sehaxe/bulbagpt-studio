@@ -10,8 +10,9 @@ import gc
 # ================= CONFIGURATION =================
 
 DATA_DIR = "data"
-OUTPUT_FILE = os.path.join(DATA_DIR, "aist_150m_mixed.txt")
+OUTPUT_FILE = os.path.join(DATA_DIR, "aist_mixed.txt")
 
+# Проверь свои пути!
 LOCAL_PURE_TEXT_FILE = os.path.join(DATA_DIR, "pure_bel_books.txt") 
 LOCAL_CULTURAX_PATH = "/home/sehaxe/bulbagpt/data/CulturalX_bel"
 
@@ -23,7 +24,7 @@ LIMIT_PYTHON = 30_000
 LIMIT_LOGIC_EN = 70_000   
 
 MIN_TEXT_LENGTH = 300     
-BUFFER_SIZE = 20000       # 🔥 Сброс на диск каждые 20k документов (бережет RAM)
+BUFFER_SIZE = 20000       
 
 # ================= ФУНКЦЫІ АЧЫСТКІ =================
 
@@ -48,68 +49,86 @@ def is_pure_belarusian(text):
     if (bad_chars / total_chars) > 0.01: return False
     return True
 
+# 🔥 ФОРМАТ ДЛЯ BISON 1.1B / LM STUDIO
 def format_llama3_instruct(system, user, assistant):
-    sys = sanitize_text(system) or "Ты разумны і карысны памочнік."
+    sys = sanitize_text(system) or "Ты разумны памочнік."
     usr = sanitize_text(user)
     ast = sanitize_text(assistant)
     if not usr or not ast: return ""
-    return (
-        f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{sys}<|eot_id|>"
-        f"<|start_header_id|>user<|end_header_id|>\n\n{usr}<|eot_id|>"
-        f"<|start_header_id|>assistant<|end_header_id|>\n\n{ast}<|eot_id|><|end_of_text|>\n"
-    )
+    return f"<s>System: {sys}\n\n### User: {usr}\n\n### Assistant: {ast}</s>\n"
 
 def format_pretrain(text):
     text = sanitize_text(text)
     if len(text) < MIN_TEXT_LENGTH: return ""
-    return f"<|begin_of_text|>{text}<|end_of_text|>\n"
+    return f"<s>{text}</s>\n"
 
-# ================= GENERATORS (STREAMING) =================
-# Генераторы выдают по одной строчке за раз, не занимая память
+# ================= GENERATORS (OPTIMIZED) =================
 
 def stream_books():
-    """Читает файл книг чанками, не загружая целиком"""
-    if not os.path.exists(LOCAL_PURE_TEXT_FILE): return
+    print(f"🔍 CHECKING FILE: {os.path.abspath(LOCAL_PURE_TEXT_FILE)}")
+    
+    if not os.path.exists(LOCAL_PURE_TEXT_FILE): 
+        print(f"❌ FILE NOT FOUND: {LOCAL_PURE_TEXT_FILE}")
+        print("   -> Make sure the file is inside the 'data' folder!")
+        return
+
+    file_size = os.path.getsize(LOCAL_PURE_TEXT_FILE)
+    print(f"   ✅ File found! Size: {file_size / 1024:.2f} KB")
+    
+    if file_size == 0:
+        print("   ⚠️ File is EMPTY!")
+        return
+
     print("📘 Init Books stream...")
     try:
-        # Читаем построчно или блоками, накапливая абзацы
         current_chunk = ""
-        with open(LOCAL_PURE_TEXT_FILE, "r", encoding="utf-8") as f:
+        count_yield = 0
+        
+        with open(LOCAL_PURE_TEXT_FILE, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
-                if line.strip() == "": # Пустая строка - разделитель абзацев
+                # Если строка пустая - считаем это концом абзаца
+                if line.strip() == "": 
                     if len(current_chunk) > MIN_TEXT_LENGTH:
                         formatted = format_pretrain(current_chunk)
                         for _ in range(UPSAMPLE_PURE_TEXT):
                             yield formatted
+                            count_yield += 1
                         current_chunk = ""
                     else:
-                        current_chunk += "\n" # Просто перенос, если мало текста
+                        # Если кусок слишком маленький, просто добавляем перенос
+                        current_chunk += "\n" 
                 else:
                     current_chunk += line
-        # Последний кусок
+        
+        # Остаток в конце файла
         if len(current_chunk) > MIN_TEXT_LENGTH:
              formatted = format_pretrain(current_chunk)
-             for _ in range(UPSAMPLE_PURE_TEXT): yield formatted
+             for _ in range(UPSAMPLE_PURE_TEXT): 
+                 yield formatted
+                 count_yield += 1
+                 
+        print(f"   📊 Books Stream Finished. Yielded: {count_yield} docs.")
+        
     except Exception as e: print(f"❌ Books Error: {e}")
 
 def stream_alpaca():
-    print("💬 Init Alpaca stream...")
+    print("⏳ Downloading Alpaca (Small)...")
     try:
-        ds = load_dataset("saillab/alpaca-belarusian-cleaned", split="train", streaming=True)
-        # Поскольку датасет маленький, можно прочитать его, но yield-ить по одному
-        # Streaming mode для HuggingFace datasets не грузит RAM
+        # streaming=False скачает файл один раз и не будет тупить
+        ds = load_dataset("saillab/alpaca-belarusian-cleaned", split="train", streaming=False)
+        print("✅ Alpaca loaded!")
         for row in ds:
             user_msg = f"{row.get('instruction','')} {row.get('input','')}"
             text = format_llama3_instruct("", user_msg, row.get('output',''))
             if text:
-                for _ in range(UPSAMPLE_INSTRUCT): # Upsample "on the fly"
-                    yield text
+                for _ in range(UPSAMPLE_INSTRUCT): yield text
     except Exception as e: print(f"❌ Alpaca Error: {e}")
 
 def stream_python():
-    print("🐍 Init Python stream...")
+    print("⏳ Downloading Python Code (Small)...")
     try:
-        ds = load_dataset("iamtarun/python_code_instructions_18k_alpaca", split="train", streaming=True)
+        ds = load_dataset("iamtarun/python_code_instructions_18k_alpaca", split="train", streaming=False)
+        print("✅ Python loaded!")
         count = 0
         for row in ds:
             if count >= LIMIT_PYTHON: break
@@ -121,9 +140,10 @@ def stream_python():
     except Exception as e: print(f"❌ Python Error: {e}")
 
 def stream_wiki():
-    print("🧠 Init Wiki stream...")
+    print("⏳ Downloading Wiki (Medium)...")
     try:
-        ds = load_dataset("wikimedia/wikipedia", "20231101.be", split="train", streaming=True)
+        ds = load_dataset("wikimedia/wikipedia", "20231101.be", split="train", streaming=False)
+        print("✅ Wiki loaded!")
         for row in ds:
             text = row.get('text', '')
             if is_pure_belarusian(text) and len(text) > MIN_TEXT_LENGTH:
@@ -131,7 +151,8 @@ def stream_wiki():
     except Exception as e: print(f"❌ Wiki Error: {e}")
 
 def stream_cosmopedia():
-    print("🇬🇧 Init Cosmopedia stream...")
+    # Тут оставляем стриминг, так как датасет огромный (25 ГБ)
+    print("🌍 Init Cosmopedia (Streaming)...")
     try:
         ds = load_dataset("HuggingFaceTB/cosmopedia", "stanford", split="train", streaming=True)
         count = 0
@@ -142,7 +163,8 @@ def stream_cosmopedia():
     except Exception as e: print(f"❌ Cosmopedia Error: {e}")
 
 def stream_culturax():
-    print("🌍 Init CulturaX stream...")
+    # Тут локальные файлы, стриминг не нужен, просто читаем
+    print("🌍 Init CulturaX (Local Parquet)...")
     try:
         parquet_files = glob.glob(os.path.join(LOCAL_CULTURAX_PATH, "*.parquet"))
         if not parquet_files: return
@@ -152,20 +174,15 @@ def stream_culturax():
         for p_file in parquet_files:
             if c_web >= LIMIT_CULTURAX: break
             try:
-                # Читаем файл
                 df = pd.read_parquet(p_file, columns=['text']).dropna()
-                # Итерируемся по строкам
                 for text in df['text']:
                     if c_web >= LIMIT_CULTURAX: break
                     if len(text) < MIN_TEXT_LENGTH: continue
                     if is_pure_belarusian(text):
                         yield format_pretrain(text)
                         c_web += 1
-                
-                # Чистим память после каждого файла
                 del df
                 gc.collect()
-                
             except Exception as e: continue
     except Exception as e: print(f"❌ CulturaX Error: {e}")
 
@@ -173,10 +190,11 @@ def stream_culturax():
 
 if not os.path.exists(DATA_DIR): os.makedirs(DATA_DIR)
 
-print(f"🚀 Starting STREAMING Generation...")
+print(f"🚀 Starting GENERATION for BISON 1.1B...")
 print(f"💾 Output: {OUTPUT_FILE}")
 
-# 1. Создаем список активных генераторов
+# Сначала создаем список генераторов
+# При этом функции запустятся до первого yield и начнут качать данные
 generators = [
     stream_books(),
     stream_alpaca(),
@@ -186,47 +204,37 @@ generators = [
     stream_culturax()
 ]
 
-# Фильтруем пустые/упавшие генераторы сразу (пробный старт)
-active_gens = []
-for g in generators:
-    if g is not None:
-        active_gens.append(g)
+active_gens = [g for g in generators if g is not None]
 
 buffer = []
 total_written = 0
 
 with open(OUTPUT_FILE, "w", encoding="utf-8") as f_out:
-    pbar = tqdm(desc="Processing & Mixing", unit=" docs")
+    pbar = tqdm(desc="Mixing Docs", unit=" docs")
     
     while active_gens:
-        # 1. Выбираем случайный источник (Random Selection)
-        # Это обеспечивает перемешивание "на лету"
         gen_idx = random.randint(0, len(active_gens) - 1)
         current_gen = active_gens[gen_idx]
         
         try:
-            # 2. Берем 1 документ
             doc = next(current_gen)
             buffer.append(doc)
             
-            # 3. Если буфер полон -> Сброс на диск
             if len(buffer) >= BUFFER_SIZE:
-                random.shuffle(buffer) # Перемешиваем внутри буфера
+                random.shuffle(buffer)
                 for item in buffer:
                     f_out.write(item)
                 total_written += len(buffer)
                 pbar.update(len(buffer))
-                buffer = [] # Очищаем RAM
+                buffer = []
                 gc.collect()
                 
         except StopIteration:
-            # Источник закончился, удаляем из списка
             active_gens.pop(gen_idx)
         except Exception as e:
-            print(f"⚠️ Stream Error: {e}")
+            # print(f"⚠️ Stream skip: {e}") # Скрываем мелкие ошибки
             active_gens.pop(gen_idx)
 
-    # 4. Записываем остатки буфера
     if buffer:
         random.shuffle(buffer)
         for item in buffer:

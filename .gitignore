@@ -8,3 +8,5 @@ bulba_rust/target/release/*
 *.gguf
 *.bin
 *.safetensors
+__pycache__/*
+runs/*
