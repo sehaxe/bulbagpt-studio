@@ -1,0 +1,10 @@
+system/*
+convert_hf_to_gguf.py
+data/*
+checkpoints/*
+output_models/*
+bulba_rust/target/*
+bulba_rust/target/release/*
+*.gguf
+*.bin
+*.safetensors
